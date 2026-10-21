@@ -25,6 +25,9 @@ from hyper_parallel.core.utils import clip_grad_norm_
 from hyper_parallel.data.batching import calculate_num_micro_batches
 from hyper_parallel.data.omni.omni_transform import build_auto_processor
 from hyper_parallel.data.omni.get_batch import OmniParallelBatch
+from hyper_parallel.distributed.encoder_parallel.batch_input import EncoderParallelInputAdapter
+from hyper_parallel.distributed.encoder_parallel.runtime import build_encoder_parallel_runtime
+from hyper_parallel.models.registry import get_model_adapter
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from hyper_parallel.trainer.runtime.logging import create_logger
 from hyper_parallel.trainer.runtime.memory import print_device_mem_info
@@ -129,6 +132,22 @@ class VLMTrainer:
             adapter = resolve_component(
                 adapter, expected_type=Target[Any], path="dataloader.get_batch.runtime_input_adapter"
             ).build()
+        encoder_config = getattr(getattr(config, "accelerator", None), "encoder_parallel", None)
+        if encoder_config is not None and encoder_config.enabled:
+            runtime = build_encoder_parallel_runtime(
+                config=encoder_config, mesh_context=self.base.mesh, model=self.base.model,
+                model_adapter_spec=get_model_adapter(self.base.model.config.model_type),
+                execution_options={
+                    "micro_batch_size": config.training.micro_batch_size,
+                    "compile_enabled": config.compile.enabled,
+                    "validate_placement": getattr(config.model, "validate_placement", False),
+                    "activation_checkpoint": config.activation_checkpoint.mode,
+                    "cp_size": self.base.mesh.cp_size,
+                    "sequence_parallel": self.base.mesh.sequence_parallel,
+                },
+            )
+            runtime.bridge.install_forward()
+            adapter = EncoderParallelInputAdapter(runtime, adapter)
         if adapter is not None:
             runtime_options["runtime_input_adapter"] = adapter
         self.base.get_batch = get_batch_builder(
