@@ -887,6 +887,7 @@ class CheckpointManager:
                 ", ".join(unexpected_keys[:10]),
             )
 
+    @torch.no_grad()
     def _gather_full_state_dict(self, *, keep_state_dict: bool) -> dict[str, Any]:
         """Gather sharded model tensors into a full CPU state dictionary."""
 
