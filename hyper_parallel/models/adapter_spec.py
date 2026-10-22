@@ -59,6 +59,9 @@ class ModelAdapterSpec:
             intercept the model before a full terminal output is materialized.
         encoder_parallel: Optional visual encoder runtime contract, used only
             when encoder parallelism is explicitly enabled.
+        replicated_subtrees: Module FQNs excluded from decoder TP/CP/EP
+            planning. Their parameters remain replicated in the source layout;
+            FSDP still shards them and synchronizes their gradients normally.
     """
 
     architecture: str
@@ -71,3 +74,4 @@ class ModelAdapterSpec:
     sharding_rules: Optional[Callable[..., Any]] = None
     loss: Optional[Callable[..., Any]] = None
     encoder_parallel: Optional[Callable[..., Any]] = None
+    replicated_subtrees: tuple[str, ...] = ()

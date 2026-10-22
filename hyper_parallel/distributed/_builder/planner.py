@@ -261,16 +261,20 @@ class ShardingPlanner:
             logger.info("ShardingPlan explain:\n%s", plan.explain())
 
     def _encoder_isolated_roots(self, model: Any, arch: str) -> tuple[str, ...]:
-        """Resolve visual ownership only for an explicitly enabled runtime."""
-        if not self._encoder_parallel_enabled:
+        """Keep adapter-declared subtrees out of decoder parallel boundaries."""
+        if not self._derive:
+            if self._encoder_parallel_enabled:
+                raise ValueError("Encoder parallel requires derived planning and a visual model adapter")
             return ()
         # Adapter discovery is optional and must not eagerly import model families.
         from hyper_parallel.models.registry import get_model_adapter  # pylint: disable=C0415
 
         adapter = get_model_adapter(arch)
-        if not self._derive or adapter is None or adapter.encoder_parallel is None:
-            raise ValueError("Encoder parallel requires derived planning and a visual model adapter")
-        roots = adapter.encoder_parallel().isolated_subtrees
+        roots = adapter.replicated_subtrees if adapter is not None else ()
+        if self._encoder_parallel_enabled:
+            if adapter is None or adapter.encoder_parallel is None:
+                raise ValueError("Encoder parallel requires derived planning and a visual model adapter")
+            roots = tuple(dict.fromkeys((*roots, *adapter.encoder_parallel().isolated_subtrees)))
         for root in roots:
             model.get_submodule(root)
         return roots

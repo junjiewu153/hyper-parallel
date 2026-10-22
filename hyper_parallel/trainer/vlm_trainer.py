@@ -132,6 +132,17 @@ class VLMTrainer:
             adapter = resolve_component(
                 adapter, expected_type=Target[Any], path="dataloader.get_batch.runtime_input_adapter"
             ).build()
+        if adapter is not None:
+            runtime_options["runtime_input_adapter"] = adapter
+        self.base.get_batch = get_batch_builder(
+            mesh_context=self.base.mesh,
+            device=self.base.device,
+            pp_shared_data=bool(getattr(config.dataloader, "pp_shared_data", False)),
+            **runtime_options,
+        )
+        bind_model = getattr(type(self.base.get_batch), "bind_model", None)
+        if callable(bind_model):
+            bind_model(self.base.get_batch, self.base.model)
         encoder_config = getattr(getattr(config, "accelerator", None), "encoder_parallel", None)
         if encoder_config is not None and encoder_config.enabled:
             runtime = build_encoder_parallel_runtime(
@@ -147,15 +158,7 @@ class VLMTrainer:
                 },
             )
             runtime.bridge.install_forward()
-            adapter = EncoderParallelInputAdapter(runtime, adapter)
-        if adapter is not None:
-            runtime_options["runtime_input_adapter"] = adapter
-        self.base.get_batch = get_batch_builder(
-            mesh_context=self.base.mesh,
-            device=self.base.device,
-            pp_shared_data=bool(getattr(config.dataloader, "pp_shared_data", False)),
-            **runtime_options,
-        )
+            self.base.get_batch.runtime_input_adapter = EncoderParallelInputAdapter(runtime, adapter)
 
     @property
     def distributed_setup(self) -> Any:

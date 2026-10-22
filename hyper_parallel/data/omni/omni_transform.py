@@ -159,6 +159,49 @@ class OmniDataTransform:
 class AutoProcessorTransform(OmniDataTransform):
     """Encode a conversation and supervise only its final assistant response."""
 
+    def _assistant_prompt_length(self, messages: list, input_ids: Any, prompt_ids: Any) -> int:
+        """Locate the prompt in processor output without retokenizing media spans.
+
+        A token crossing the source/target character boundary is masked in full.
+        This preserves native processor inputs, unlike separately encoding and
+        concatenating the source and target, which changes sequence-aligned fields.
+        """
+        if len(prompt_ids) < len(input_ids) and input_ids[:len(prompt_ids)].equal(prompt_ids):
+            return len(prompt_ids)
+
+        full_text = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False,
+        )
+        prompt_text = self.processor.apply_chat_template(
+            messages[:-1], tokenize=False, add_generation_prompt=True,
+        )
+        if not full_text.startswith(prompt_text):
+            raise ValueError("Assistant generation prompt must be a text prefix of the full conversation")
+
+        full_tokens = input_ids.tolist()
+        prompt_tokens = prompt_ids.tolist()
+        common_length = 0
+        for full_token, prompt_token in zip(full_tokens, prompt_tokens):
+            if full_token != prompt_token:
+                break
+            common_length += 1
+        return self._merged_prompt_length(full_tokens, prompt_tokens, common_length)
+
+    def _merged_prompt_length(self, full_tokens: list[int], prompt_tokens: list[int], common_length: int) -> int:
+        """Accept only text-equivalent retokenization after the shared token prefix."""
+        decode_kwargs = {"skip_special_tokens": False, "clean_up_tokenization_spaces": False}
+        tokenizer = self.processor.tokenizer
+        full_tail = tokenizer.decode(full_tokens[common_length:], **decode_kwargs)
+        prompt_tail = tokenizer.decode(prompt_tokens[common_length:], **decode_kwargs)
+        # Reject lossy decoding rather than guessing a boundary inside UTF-8 bytes.
+        if not prompt_tail or "\ufffd" in full_tail or "\ufffd" in prompt_tail or not full_tail.startswith(prompt_tail):
+            raise ValueError("Assistant prompt tokens differ beyond a lossless text boundary merge")
+        for end in range(common_length + 1, len(full_tokens) + 1):
+            decoded = tokenizer.decode(full_tokens[common_length:end], **decode_kwargs)
+            if full_tail.startswith(decoded) and decoded.startswith(prompt_tail):
+                return end
+        raise ValueError("Cannot locate assistant supervision boundary in processor tokens")
+
     def encode_sample(self, sample: dict[str, Any]) -> dict[str, Any]:
         """Build model inputs and assistant-only labels from processor messages."""
         messages = self.prepare_messages(sample)
@@ -184,9 +227,7 @@ class AutoProcessorTransform(OmniDataTransform):
         prompt_ids = prompt_sample["input_ids"].squeeze(0)
         if len(input_ids) > self.max_seq_len:
             raise ValueError("Omni sample exceeds max_seq_len; refusing to truncate a possible media span")
-        prompt_length = len(prompt_ids)
-        if prompt_length >= len(input_ids) or not input_ids[:prompt_length].equal(prompt_ids):
-            raise ValueError("Assistant prompt tokens must be a prefix of the full conversation")
+        prompt_length = self._assistant_prompt_length(messages, input_ids, prompt_ids)
 
         labels = input_ids.clone()
         labels[:prompt_length] = IGNORE_INDEX
