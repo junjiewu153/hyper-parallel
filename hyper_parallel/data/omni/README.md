@@ -15,7 +15,7 @@ targets must migrate to the example below; there are no compatibility aliases.
 | --- | --- |
 | `OmniDataTransform` | Eager encoding, deferred encoding after selection, and batch encoding hooks |
 | `AutoProcessorTransform` | Processor-backed conversation encoding and final-assistant supervision |
-| `OmniMappingDataset` | Local JSON/JSONL indexing, relative media paths, and lifecycle delegation |
+| `OmniMappingDataset` | Local JSON/JSONL/Parquet indexing, relative media paths, and lifecycle delegation |
 | `OmniPackingLoader` | Candidate selection, packing, and checkpointing of unread buffered samples |
 | `SamplePacker` | Concatenate fields, offset media token starts, and produce `cu_seq_lens` |
 | `OmniCollator` | Stack token fields and concatenate modality fields without dtype conversion |
@@ -38,7 +38,12 @@ selection budget, not a truncation length: a sample larger than the budget is
 emitted alone. `AutoProcessorTransform` rejects samples exceeding `max_seq_len`
 instead of cutting through a media span. Start with TP=CP=PP=1.
 
-Sources are local `.jsonl` records or a `.json` list. `data_path` may also be an
+Sources are local `.jsonl` records, a `.json` list, or a `.parquet` file (requires
+the optional `pyarrow` package). Parquet keeps row-group/row indices and caches
+at most one row group per worker, without decoding images during indexing.
+Choose suitably sized row groups when preparing large image datasets; each
+worker's cache can hold a full row group's compressed image bytes.
+`data_path` may also be an
 explicit `{train: ..., valid: ..., test: ...}` mapping. Each default-transform
 record contains `messages`; its final message must be an assistant response.
 Relative image/video/audio paths are resolved against the source file directory.
@@ -48,6 +53,38 @@ Processor templates must preserve the token prefix produced by
 `add_generation_prompt=True`; incompatible templates are rejected, not silently
 masked. Existing text-specific tools/reasoning fixes are not automatically used
 by this separate processor path.
+
+### Embedded images in Parquet
+
+The default transform also accepts records with string message contents and a
+separate `images` list, for example this Python representation of a Parquet row:
+
+```python
+{
+    "messages": [
+        {"role": "user", "content": "Compare <image> with <image>."},
+        {"role": "assistant", "content": "The first image ..."},
+    ],
+    "images": [
+        {"bytes": png_bytes, "path": None},
+        {"bytes": None, "path": "images/second.png"},
+    ],
+}
+```
+
+`<image>` occurrences in strings or typed text blocks consume `images` in order
+across the entire conversation. Bare `{"type": "image"}` blocks also consume
+one entry. Bytes are decoded to fully loaded RGB PIL images before calling the
+processor; a non-null `bytes` value takes precedence over `path`. Path-only entries
+(including plain path strings) are resolved relative to the source file.
+The transform converts string contents to typed text/image blocks for this
+external-images format, including assistant messages. Explicit image blocks
+with their own source remain independent and do not consume the list.
+Missing/extra images and malformed bytes raise errors rather than dropping
+images or guessing their placement. Existing JSON/JSONL records with explicit
+media blocks need no format changes. Set `dataset.data_path` to the Parquet file;
+the transform and loader targets do not change. This support does not change the
+pure-text reader or its configuration.
 
 ## Packing and model integration boundary
 

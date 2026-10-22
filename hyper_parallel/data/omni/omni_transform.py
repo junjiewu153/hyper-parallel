@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import copy
+import io
 import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -83,35 +84,60 @@ class OmniDataTransform:
 
     @staticmethod
     def is_valid_sample(sample: Mapping[str, Any]) -> bool:
-        """Return whether one source record contains conversation messages."""
+        """Return whether one source record contains conversation messages.
+
+        Args:
+            sample: Raw source record.
+        """
         messages = sample.get("messages")
         if not isinstance(messages, list):
             raise ValueError("Omni sample messages must be a list")
         return bool(messages)
 
     def encode_sample(self, sample: dict[str, Any]) -> dict[str, Any]:
-        """Encode one source sample into one model-ready sample."""
+        """Encode one source sample into one model-ready sample.
+
+        Args:
+            sample: Raw source record.
+        """
         raise NotImplementedError(f"{type(self).__name__} does not implement encode_sample")
 
     def preencode_sample(self, sample: dict[str, Any]) -> dict[str, Any]:
-        """Prepare metadata used by a packing selector without full encoding."""
+        """Prepare metadata used by a packing selector without full encoding.
+
+        Args:
+            sample: Raw source record.
+        """
         raise NotImplementedError(f"{type(self).__name__} does not implement preencode_sample")
 
     def postencode_sample(self, sample: dict[str, Any]) -> dict[str, Any]:
-        """Encode selected online or offline metadata into a model-ready sample."""
+        """Encode selected online or offline metadata into a model-ready sample.
+
+        Args:
+            sample: Selected candidate and its encoding metadata.
+        """
         raise NotImplementedError(f"{type(self).__name__} does not implement postencode_sample")
 
     def encode_batch(self, batch: Any) -> Any:
-        """Apply an optional model-specific batch encoding stage."""
+        """Apply an optional model-specific batch encoding stage.
+
+        Args:
+            batch: Collated model inputs.
+        """
         return batch
 
     def prepare_messages(self, sample: dict[str, Any]) -> list[dict[str, Any]]:
-        """Copy messages and resolve media paths relative to their JSONL file."""
+        """Bind external images in placeholder order and resolve source-relative paths.
+
+        Args:
+            sample: Messages, optional external images, and source path metadata.
+        """
         messages = sample.get("messages")
         if not isinstance(messages, list) or not messages:
             raise ValueError("Omni sample must contain non-empty messages")
 
         prepared_messages = copy.deepcopy(messages)
+        self._bind_external_images(prepared_messages, sample.get("images"))
         source_path = sample.get(ONLINE_SOURCE_PATH_KEY)
         if source_path is None:
             return prepared_messages
@@ -124,6 +150,77 @@ class OmniDataTransform:
             for content_block in content:
                 self._resolve_media_block(content_block, source_directory)
         return prepared_messages
+
+    def _bind_external_images(self, messages: list, images: Any) -> None:
+        """Consume external images only after checking the complete placeholder count."""
+        if images is None:
+            images = []
+        if not isinstance(images, list):
+            raise TypeError("Omni sample images must be a list")
+        placeholders = []
+        for message in messages:
+            content = message.get("content")
+            if isinstance(content, str) and (images or "<image>" in content):
+                content = [{"type": "text", "text": content}]
+            if isinstance(content, list):
+                message["content"] = self._expand_image_placeholders(content, placeholders)
+        if len(placeholders) != len(images):
+            raise ValueError(f"Image placeholder count {len(placeholders)} does not match images count {len(images)}")
+        for index, (block, image) in enumerate(zip(placeholders, images)):
+            block["image"] = self._decode_external_image(image, index)
+
+    @staticmethod
+    def _expand_image_placeholders(content: list, placeholders: list) -> list:
+        """Preserve text around each placeholder and leave explicit media untouched."""
+        expanded = []
+        for block in content:
+            if not isinstance(block, dict):
+                expanded.append(block)
+                continue
+            text_content = block.get("text")
+            if (block.get("type") == "text"
+                    and isinstance(text_content, str) and "<image>" in text_content):
+                for index, text in enumerate(block["text"].split("<image>")):
+                    if index:
+                        image_block = {"type": "image"}
+                        expanded.append(image_block)
+                        placeholders.append(image_block)
+                    if text:
+                        expanded.append({**block, "text": text})
+            else:
+                expanded.append(block)
+                if block.get("type") == "image":
+                    # Arrow structs can materialize absent source fields as nulls.
+                    source_fields = ("image", "url", "path", "base64")
+                    for field in source_fields:
+                        if block.get(field) is None:
+                            block.pop(field, None)
+                    if not any(field in block for field in source_fields):
+                        placeholders.append(block)
+        return expanded
+
+    @staticmethod
+    def _decode_external_image(image: Any, index: int) -> Any:
+        """Prefer embedded bytes over path, returning a fully loaded RGB image."""
+        if isinstance(image, str) and image:
+            return image
+        if isinstance(image, Mapping):
+            payload = image.get("bytes")
+            if payload is not None:
+                if not isinstance(payload, (bytes, bytearray, memoryview)):
+                    raise TypeError(f"images[{index}].bytes must be binary image data")
+                # Pillow is optional for configurations that only use text/path messages.
+                from PIL import Image  # pylint: disable=C0415
+
+                try:
+                    with io.BytesIO(payload) as buffer, Image.open(buffer) as decoded:
+                        return decoded.convert("RGB")
+                except (OSError, ValueError) as error:
+                    raise ValueError(f"Cannot decode images[{index}].bytes") from error
+            path = image.get("path")
+            if isinstance(path, str) and path:
+                return path
+        raise ValueError(f"images[{index}] must be a path or a mapping with bytes/path")
 
     @classmethod
     def _resolve_media_block(cls, content_block: Any, source_directory: str) -> None:
@@ -141,7 +238,7 @@ class OmniDataTransform:
             return
 
         if block_type in ("image", "video", "audio"):
-            for field in (block_type, "url"):
+            for field in (block_type, "url", "path"):
                 media_field = content_block.get(field)
                 if isinstance(media_field, str):
                     content_block[field] = cls._resolve_media_path(media_field, source_directory)
@@ -203,7 +300,11 @@ class AutoProcessorTransform(OmniDataTransform):
         raise ValueError("Cannot locate assistant supervision boundary in processor tokens")
 
     def encode_sample(self, sample: dict[str, Any]) -> dict[str, Any]:
-        """Build model inputs and assistant-only labels from processor messages."""
+        """Build model inputs and assistant-only labels from processor messages.
+
+        Args:
+            sample: Raw multimodal source record.
+        """
         messages = self.prepare_messages(sample)
         if len(messages) < 2 or messages[-1].get("role") != "assistant":
             raise ValueError("Omni training sample must end with a final assistant message")
@@ -254,7 +355,11 @@ class _OmniTransformStrategy:
 
     @classmethod
     def from_transform(cls, transform: OmniDataTransform) -> "_OmniTransformStrategy":
-        """Build one strategy from Energon-style overridden hooks."""
+        """Build one strategy from Energon-style overridden hooks.
+
+        Args:
+            transform: Transform whose overridden hooks determine the lifecycle.
+        """
         encode_sample = cls._is_overridden(transform, "encode_sample")
         preencode_sample = cls._is_overridden(transform, "preencode_sample")
         postencode_sample = cls._is_overridden(transform, "postencode_sample")
@@ -301,21 +406,33 @@ class _OmniTransformStrategy:
         return method_overridden
 
     def prepare_sample(self, sample: Any) -> Any:
-        """Encode a sample or attach metadata before packing selection."""
+        """Encode a sample or attach metadata before packing selection.
+
+        Args:
+            sample: Raw source record.
+        """
         prepared_sample = sample
         if self.sample_encoder is not None:
             prepared_sample = self.sample_encoder(sample)
         return prepared_sample
 
     def encode_selected_sample(self, sample: Any) -> Any:
-        """Finish encoding a sample after packing selection."""
+        """Finish encoding a sample after packing selection.
+
+        Args:
+            sample: Selected candidate.
+        """
         encoded_sample = sample
         if self.selected_sample_encoder is not None:
             encoded_sample = self.selected_sample_encoder(sample)
         return encoded_sample
 
     def prepare_samples(self, raw_sample: Any) -> list[Any]:
-        """Return encoded, preencoded, or unchanged samples for candidate selection."""
+        """Return encoded, preencoded, or unchanged samples for candidate selection.
+
+        Args:
+            raw_sample: Raw source record.
+        """
         prepared_sample = self.prepare_sample(raw_sample)
         prepared_samples = [prepared_sample]
         return prepared_samples

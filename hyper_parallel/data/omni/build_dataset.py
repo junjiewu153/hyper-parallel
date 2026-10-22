@@ -30,8 +30,50 @@ from hyper_parallel.data.omni.omni_transform import OmniDataTransform, _OmniTran
 from hyper_parallel.data.parallel import create_dataloader_parallel_context
 
 
+class _ParquetRecords:
+    """Index rows without decoding media; cache at most one row group per worker."""
+
+    def __init__(self, path: str, transform: OmniDataTransform) -> None:
+        """Scan bounded batches for valid row indices without retaining open files."""
+        # Parquet is optional; JSON/text users must not require Arrow at import time.
+        from pyarrow import parquet  # pylint: disable=C0415
+
+        self.path = path
+        self.indices = []
+        self._cache_key = None
+        self._table = None
+        with parquet.ParquetFile(path) as source:
+            for group in range(source.num_row_groups):
+                offset = 0
+                for batch in source.iter_batches(batch_size=256, row_groups=[group]):
+                    for index, record in enumerate(batch.to_pylist(), start=offset):
+                        if transform.is_valid_sample(record):
+                            self.indices.append((group, index))
+                    offset += batch.num_rows
+
+    def __getstate__(self) -> dict:
+        """Avoid serializing Arrow caches into spawned DataLoader workers."""
+        state = self.__dict__.copy()
+        state.update(_cache_key=None, _table=None)
+        return state
+
+    def __getitem__(self, index: tuple[int, int]) -> dict:
+        """Return a fresh Python record from the worker-local row-group cache."""
+        # Lazy optional import also permits spawned workers to reconstruct this reader.
+        from pyarrow import parquet  # pylint: disable=C0415
+
+        group, row = index
+        cache_key = (os.getpid(), group)
+        if self._cache_key != cache_key:
+            self._table = None
+            with parquet.ParquetFile(self.path) as source:
+                self._table = source.read_row_group(group)
+            self._cache_key = cache_key
+        return self._table.slice(row, 1).to_pylist()[0]
+
+
 class OmniMappingDataset(Dataset):
-    """Read JSON/JSONL records and defer encoding to the configured lifecycle.
+    """Read JSON/JSONL/Parquet records and defer encoding to the configured lifecycle.
 
     JSONL uses byte offsets so heterogeneous tool/media records do not need
     Arrow schema unification. Source order is left to the existing DP sampler.
@@ -43,6 +85,7 @@ class OmniMappingDataset(Dataset):
         self.data_transform = transform
         self.strategy = _OmniTransformStrategy.from_transform(transform)
         self.records = None
+        self.parquet_records = None
         self.indices = []
         if self.data_path.endswith(".jsonl"):
             with open(self.data_path, "rb") as handle:
@@ -61,8 +104,11 @@ class OmniMappingDataset(Dataset):
             self.indices = [
                 index for index, record in enumerate(self.records) if transform.is_valid_sample(record)
             ]
+        elif self.data_path.endswith(".parquet"):
+            self.parquet_records = _ParquetRecords(self.data_path, transform)
+            self.indices = self.parquet_records.indices
         else:
-            raise ValueError("Isolated Omni sources currently support local .json or .jsonl files")
+            raise ValueError("Omni sources support local .json, .jsonl or .parquet files")
         if not self.indices:
             raise ValueError("Omni source contains no valid records")
 
@@ -73,7 +119,9 @@ class OmniMappingDataset(Dataset):
     def __getitem__(self, index: int) -> Any:
         """Prepare one candidate without consuming other source records."""
         source_index = self.indices[index]
-        if self.records is None:
+        if self.parquet_records is not None:
+            record = self.parquet_records[source_index]
+        elif self.records is None:
             with open(self.data_path, "rb") as handle:
                 handle.seek(source_index)
                 record = json.loads(handle.readline())
@@ -83,11 +131,19 @@ class OmniMappingDataset(Dataset):
         return self.strategy.prepare_sample(record)
 
     def encode_selected_sample(self, sample: Any) -> Any:
-        """Finish encoding only a selected candidate."""
+        """Finish encoding only a selected candidate.
+
+        Args:
+            sample: Selected candidate.
+        """
         return self.strategy.encode_selected_sample(sample)
 
     def encode_batch(self, batch: Any) -> Any:
-        """Adapt collated fields to the model-specific forward contract."""
+        """Adapt collated fields to the model-specific forward contract.
+
+        Args:
+            batch: Collated model inputs.
+        """
         return self.data_transform.encode_batch(batch)
 
 
@@ -101,7 +157,7 @@ def build_online_omni_mapping_dataset(
     """Build local multimodal datasets without replacing text source policy.
 
     Args:
-        data_path: Local JSON/JSONL file or explicit train/valid/test path mapping.
+        data_path: Local JSON/JSONL/Parquet file or explicit train/valid/test path mapping.
         transform: Omni encoding lifecycle.
         data_config: Reserved options; nonempty options are rejected.
         mesh_context: Optional trainer mesh, used to build only on TP source ranks.
