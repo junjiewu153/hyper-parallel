@@ -22,6 +22,9 @@ from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import MagicMock, patch
 
+import torch
+import torch.distributed as dist
+
 from hyper_parallel.components.checkpoint.config import CheckpointingConfig
 from hyper_parallel.trainer.callbacks.base import TrainerState
 from hyper_parallel.trainer.callbacks.checkpoint_callback import CheckpointerCallback
@@ -29,6 +32,12 @@ from hyper_parallel.trainer.callbacks.checkpoint_callback import CheckpointerCal
 
 class TestCheckpointCallback(unittest.TestCase):
     """Verify elapsed-time saving and safe checkpoint retention."""
+
+    def setUp(self) -> None:
+        # Other UT modules may leave a real (stale) process group behind; the
+        # rank-consistent time-cadence path would then hit a dead collective.
+        if torch.distributed.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
 
     @staticmethod
     def _build_callback(
