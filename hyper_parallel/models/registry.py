@@ -79,7 +79,7 @@ def _resolve_custom_model_cls(arch_name: str) -> Optional[type]:
 # ────────────────────────────────────────────────────────────────────────────
 MODEL_ADAPTER_REGISTRY = {}
 
-# normalized lookup key (see _normalize_family_key) → spec.model_type
+# Exact normalized identities take precedence over task-stripped family aliases.
 _FAMILY_ALIASES: Dict[str, str] = {}
 
 # Provider-directory aliases: normalized lookup key → family directory whose
@@ -101,12 +101,17 @@ _ARCH_SUFFIXES = (
 )
 
 
+def _normalize_model_key(name: str) -> str:
+    """Normalize spelling without discarding the model's task identity."""
+    return name.lower().replace("_", "").replace("-", "")
+
+
 def _normalize_family_key(name: str) -> str:
     """Canonical lookup key: lowercase, separators removed, HF task suffix
     stripped — so the architectures spelling (``deepseekv3``), the model_type
     spelling (``deepseek_v3``) and the class spelling
     (``DeepseekV3ForCausalLM``) all resolve to the same family."""
-    key = name.lower().replace("_", "").replace("-", "")
+    key = _normalize_model_key(name)
     for suffix in _ARCH_SUFFIXES:
         if key.endswith(suffix):
             key = key[: -len(suffix)]
@@ -145,6 +150,8 @@ def register_model_adapter(spec: ModelAdapterSpec) -> None:
         )
     MODEL_ADAPTER_REGISTRY[spec.model_type] = spec
     for alias in (
+            _normalize_model_key(spec.model_type),
+            _normalize_model_key(spec.architecture),
             _normalize_family_key(spec.model_type),
             _normalize_family_key(spec.architecture),
     ):
@@ -156,26 +163,28 @@ def get_model_adapter(model_type: str) -> Optional[ModelAdapterSpec]:
 
     Accepts any spelling — model_type (``deepseek_v3``), HF architecture
     (``DeepseekV3ForCausalLM``) or the canonical arch name used by the
-    planner (``deepseekv3``).
+    planner (``deepseekv3``). Exact identities take precedence over family
+    aliases so text and multimodal architectures can select different specs.
     """
+    key = _normalize_model_key(model_type)
+    family_key = _normalize_family_key(model_type)
     spec = MODEL_ADAPTER_REGISTRY.get(model_type)
     if spec is None:
-        canonical = _FAMILY_ALIASES.get(_normalize_family_key(model_type))
+        canonical = _FAMILY_ALIASES.get(key) or _FAMILY_ALIASES.get(family_key)
         if canonical is not None:
             spec = MODEL_ADAPTER_REGISTRY.get(canonical)
     if spec is None:
-        key = _normalize_family_key(model_type)
         providers = _discover_family_providers()
-        family_dir = _FAMILY_DIR_ALIASES.get(key)
+        family_dir = _FAMILY_DIR_ALIASES.get(family_key)
         module_path = providers.get(
-            key if family_dir is None else _normalize_family_key(family_dir)
+            family_key if family_dir is None else _normalize_family_key(family_dir)
         )
         if module_path is not None:
             # Importing the registration module self-registers the family.
             importlib.import_module(module_path)
             spec = MODEL_ADAPTER_REGISTRY.get(model_type)
         if spec is None:
-            canonical = _FAMILY_ALIASES.get(key)
+            canonical = _FAMILY_ALIASES.get(key) or _FAMILY_ALIASES.get(family_key)
             if canonical is not None:
                 spec = MODEL_ADAPTER_REGISTRY.get(canonical)
     return spec

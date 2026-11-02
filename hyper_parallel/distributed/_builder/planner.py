@@ -260,16 +260,28 @@ class ShardingPlanner:
         if enabled:
             logger.info("ShardingPlan explain:\n%s", plan.explain())
 
+    @staticmethod
+    def _get_model_adapter(model: Any, arch: str):
+        """Resolve task-specific adapters before the lossy planner family key."""
+        # Adapter discovery must not eagerly import optional model families.
+        from hyper_parallel.models.registry import get_model_adapter  # pylint: disable=C0415
+
+        config = getattr(model, "config", None)
+        architectures = getattr(config, "architectures", None) or ()
+        for key in (getattr(config, "model_type", None), *architectures, type(model).__name__, arch):
+            if key:
+                adapter = get_model_adapter(key)
+                if adapter is not None:
+                    return adapter
+        return None
+
     def _encoder_isolated_roots(self, model: Any, arch: str) -> tuple[str, ...]:
         """Keep adapter-declared subtrees out of decoder parallel boundaries."""
         if not self._derive:
             if self._encoder_parallel_enabled:
                 raise ValueError("Encoder parallel requires derived planning and a visual model adapter")
             return ()
-        # Adapter discovery is optional and must not eagerly import model families.
-        from hyper_parallel.models.registry import get_model_adapter  # pylint: disable=C0415
-
-        adapter = get_model_adapter(arch)
+        adapter = self._get_model_adapter(model, arch)
         roots = adapter.replicated_subtrees if adapter is not None else ()
         if self._encoder_parallel_enabled:
             if adapter is None or adapter.encoder_parallel is None:
@@ -598,10 +610,7 @@ class ShardingPlanner:
         sharding rules (``ModelAdapterSpec.sharding_rules``, resolved through
         the models registry — the planner core carries no per-family
         knowledge)."""
-        from hyper_parallel.models.registry import (  # pylint: disable=import-outside-toplevel
-            get_model_adapter,
-        )
-        spec = get_model_adapter(arch)
+        spec = self._get_model_adapter(model, arch)
         rules = []
         if spec is not None and spec.sharding_rules is not None:
             rules = list(spec.sharding_rules())
