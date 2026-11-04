@@ -21,6 +21,7 @@ gradients are evaluated one local sequence chunk at a time.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -37,6 +38,9 @@ from transformers.utils import ModelOutput
 
 from hyper_parallel.core.fully_shard.api import HSDPModule
 from hyper_parallel.components.losses.mtp_objective import mtp_objectives, validate_mtp_loss_weight
+
+
+logger = logging.getLogger(__name__)
 
 
 def _linear_cross_entropy_chunk(
@@ -256,8 +260,24 @@ class ChunkedCausalLMLoss(nn.Module):
         self.chunk_size = chunk_size
         self.ignore_index = ignore_index
         self._model_is_bound = False
+        self._logged_first_output = False
+        self._first_input_shape = None
+        self._first_target_shape = None
         self.mtp_loss_weight = validate_mtp_loss_weight(mtp_loss_weight)
         self.mtp_enabled = False
+
+    def _log_binding(self, model: nn.Module, adapter: str, *, bound: bool) -> None:
+        """Report actual binding state on global rank zero without reading tensor values."""
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return
+        config = getattr(model, "config", None)
+        logger.info(
+            "chunk-loss %s: model_class=%s.%s model_type=%r architectures=%s adapter=%s chunk_size=%d mtp=%s",
+            "bound" if bound else "binding requested",
+            type(model).__module__, type(model).__qualname__,
+            getattr(config, "model_type", None), getattr(config, "architectures", None),
+            adapter, self.chunk_size, bool(getattr(model, "_hp_mtp_enabled", False)),
+        )
 
     @staticmethod
     def _parallel_size(distributed_setup: Any, name: str) -> int:
@@ -282,6 +302,7 @@ class ChunkedCausalLMLoss(nn.Module):
         # same value or DP/CP weighting would count a different token set.
         from hyper_parallel.data.constants import IGNORE_INDEX  # pylint: disable=import-outside-toplevel
 
+        self._log_binding(model, "pending", bound=False)
         if self.ignore_index != IGNORE_INDEX:
             raise ValueError(
                 "ChunkedCausalLMLoss Trainer integration requires "
@@ -312,6 +333,7 @@ class ChunkedCausalLMLoss(nn.Module):
         validate_mtp_loss_weight(self.mtp_loss_weight, enabled=self.mtp_enabled)
         if self.mtp_enabled:
             self._model_is_bound = True
+            self._log_binding(model, "model-managed MTP objective", bound=True)
             return
 
         # Lazy imports keep generic loss-package import independent of concrete
@@ -334,6 +356,7 @@ class ChunkedCausalLMLoss(nn.Module):
             )
         bind_chunk_loss(model)
         self._model_is_bound = True
+        self._log_binding(model, getattr(adapter, "__name__", type(adapter).__qualname__), bound=True)
 
     def prepare_model_inputs(
         self,
@@ -355,6 +378,11 @@ class ChunkedCausalLMLoss(nn.Module):
         if loss_mask is not None:
             if not isinstance(loss_mask, torch.Tensor) or loss_mask.shape != targets.shape:
                 raise ValueError("loss_mask must be a Tensor with the same shape as targets")
+
+        if not self.mtp_enabled and not self._logged_first_output:
+            input_ids = model_inputs.get("input_ids")
+            self._first_input_shape = tuple(input_ids.shape) if isinstance(input_ids, torch.Tensor) else None
+            self._first_target_shape = tuple(targets.shape)
 
         prepared = dict(model_inputs)
         # A legacy one-dictionary caller may leave loss-only fields in
@@ -395,6 +423,16 @@ class ChunkedCausalLMLoss(nn.Module):
             raise ValueError(
                 "ChunkedCausalLMLoss requires a scalar Tensor valid_token_count"
             )
+
+        if not self._logged_first_output:
+            self._logged_first_output = True
+            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                logger.info(
+                    "chunk-loss first forward verified: chunk_size=%d input_shape=%s target_shape=%s "
+                    "logits=None loss_sum_shape=%s valid_token_count_shape=%s",
+                    self.chunk_size, self._first_input_shape, self._first_target_shape,
+                    tuple(loss_sum.shape), tuple(valid_token_count.shape),
+                )
 
         denominator = valid_token_count.clamp_min(1).to(loss_sum.dtype)
         local_loss = loss_sum / denominator
